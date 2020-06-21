@@ -38,6 +38,8 @@ typedef struct _GumExecFrame GumExecFrame;
 typedef struct _GumExecCtx GumExecCtx;
 typedef struct _GumExecBlock GumExecBlock;
 
+typedef guint8 GumExecBlockFlags;
+typedef guint GumPrologState;
 typedef struct _GumGeneratorContext GumGeneratorContext;
 typedef struct _GumCalloutEntry GumCalloutEntry;
 typedef struct _GumInstruction GumInstruction;
@@ -143,6 +145,7 @@ struct _GumExecBlock
   guint8 * code_begin;
   guint8 * code_end;
 
+  GumExecBlockFlags flags;
   gint recycle_count;
 };
 
@@ -155,6 +158,17 @@ struct _GumSlab
 
   guint num_blocks;
   GumExecBlock blocks[];
+};
+
+enum _GumExecBlockFlags
+{
+  GUM_EXEC_ACTIVATION_TARGET = (1 << 0),
+};
+
+enum _GumPrologState
+{
+  GUM_PROLOG_CLOSED,
+  GUM_PROLOG_OPEN
 };
 
 struct _GumGeneratorContext
@@ -441,8 +455,9 @@ static gboolean gum_generator_context_is_timing_sensitive (
 static void gum_generator_context_advance_exclusive_load_offset (
     GumGeneratorContext * gc);
 
-static gboolean gum_stalker_is_thumb (gconstpointer address);
-static gboolean gum_stalker_is_kuser_helper (gconstpointer address);
+static gpointer gum_strip_thumb_bit (gpointer address);
+static gboolean gum_is_thumb (gconstpointer address);
+static gboolean gum_is_kuser_helper (gconstpointer address);
 
 static gboolean gum_is_exclusive_load_insn (const cs_insn * insn);
 static gboolean gum_is_exclusive_store_insn (const cs_insn * insn);
@@ -520,7 +535,7 @@ gum_stalker_is_call_excluding (GumExecCtx * ctx,
   if (ctx->activation_target != NULL)
     return FALSE;
 
-  if (gum_stalker_is_kuser_helper (address))
+  if (gum_is_kuser_helper (address))
     return TRUE;
 
   for (i = 0; i != exclusions->len; i++)
@@ -1176,6 +1191,22 @@ gum_exec_ctx_contains (GumExecCtx * ctx,
   return FALSE;
 }
 
+static gboolean
+gum_exec_ctx_may_now_backpatch (GumExecCtx * ctx,
+                                GumExecBlock * target_block)
+{
+  if (g_atomic_int_get (&ctx->state) != GUM_EXEC_CTX_ACTIVE)
+    return FALSE;
+
+  if ((target_block->flags & GUM_EXEC_ACTIVATION_TARGET) != 0)
+    return FALSE;
+
+  if (target_block->recycle_count < ctx->stalker->trust_threshold)
+    return FALSE;
+
+  return TRUE;
+}
+
 static gpointer
 gum_exec_ctx_replace_block (GumExecCtx * ctx,
                             gpointer start_address)
@@ -1207,6 +1238,7 @@ gum_exec_ctx_replace_block (GumExecCtx * ctx,
     if (start_address == ctx->activation_target)
     {
       ctx->activation_target = NULL;
+      ctx->current_block->flags |= GUM_EXEC_ACTIVATION_TARGET;
     }
 
     gum_exec_ctx_maybe_unfollow (ctx, start_address);
@@ -1234,7 +1266,7 @@ gum_exec_ctx_obtain_block_for (GumExecCtx * ctx,
                                gpointer real_address,
                                gpointer * code_address_ptr)
 {
-  if (gum_stalker_is_thumb (real_address))
+  if (gum_is_thumb (real_address))
   {
     return gum_exec_ctx_obtain_thumb_block_for (ctx, real_address,
         code_address_ptr);
@@ -1304,13 +1336,16 @@ gum_exec_ctx_obtain_arm_block_for (GumExecCtx * ctx,
 
   if (gc.continuation_real_address != NULL)
   {
-    /*
-     * This is required to support the situation where the amount of code
-     * emitted to instrument a block exceeds the minimum we check for before we
-     * start instrumenting a block and it needs to be split. This is only likely
-     * to be of concern for very long linear execution blocks.
-     */
-    g_error ("continuation_real_address unsupported");
+    gum_exec_block_arm_open_prolog (block, &gc);
+
+    gum_arm_writer_put_call_address_with_arguments (cw,
+        GUM_ADDRESS (gum_exec_ctx_replace_block), 2,
+        GUM_ARG_ADDRESS, GUM_ADDRESS (ctx),
+        GUM_ARG_ADDRESS, GUM_ADDRESS (gc.continuation_real_address));
+
+    gum_exec_block_arm_close_prolog (block, &gc);
+
+    gum_exec_block_write_arm_exec_generated_code (cw, ctx);
   }
 
   gum_arm_writer_put_breakpoint (cw);
@@ -1346,7 +1381,7 @@ gum_exec_ctx_obtain_thumb_block_for (GumExecCtx * ctx,
     return block;
 
   block = gum_exec_block_new (ctx);
-  aligned_address = GSIZE_TO_POINTER (GPOINTER_TO_SIZE (real_address) & ~0x1);
+  aligned_address = gum_strip_thumb_bit (real_address);
   block->real_begin = aligned_address;
   *code_address_ptr = block->code_begin + 1;
 
@@ -1387,13 +1422,16 @@ gum_exec_ctx_obtain_thumb_block_for (GumExecCtx * ctx,
 
   if (gc.continuation_real_address != NULL)
   {
-    /*
-     * This is required to support the situation where the amount of code
-     * emitted to instrument a block exceeds the minimum we check for before we
-     * start instrumenting a block and it needs to be split. This is only likely
-     * to be of concern for very long linear execution blocks.
-     */
-    g_error ("continuation_real_address unsupported");
+    gum_exec_block_thumb_open_prolog (block, &gc);
+
+    gum_thumb_writer_put_call_address_with_arguments (cw,
+        GUM_ADDRESS (gum_exec_ctx_replace_block), 2,
+        GUM_ARG_ADDRESS, GUM_ADDRESS (ctx),
+        GUM_ARG_ADDRESS, GUM_ADDRESS (gc.continuation_real_address) + 1);
+
+    gum_exec_block_thumb_close_prolog (block, &gc);
+
+    gum_exec_block_write_thumb_exec_generated_code (cw, ctx);
   }
 
   gum_thumb_writer_put_breakpoint (cw);
@@ -2741,6 +2779,40 @@ gum_exec_ctx_thumb_load_real_register_into (GumExecCtx * ctx,
   }
 }
 
+static void
+gum_exec_ctx_backpatch_thumb_branch_to_current (GumExecCtx * ctx,
+                                                gpointer backpatch_start,
+                                                GumPrologState prolog_state)
+{
+  GumExecBlock * block = ctx->current_block;
+  gboolean just_unfollowed;
+
+  just_unfollowed = block == NULL;
+  if (just_unfollowed)
+    return;
+
+  if (gum_exec_ctx_may_now_backpatch (ctx, block))
+  {
+    const gsize code_max_size = 128;
+    GumStalker * stalker = ctx->stalker;
+    GumThumbWriter * cw = &ctx->thumb_writer;
+
+    gum_stalker_thaw (stalker, backpatch_start, code_max_size);
+    gum_thumb_writer_reset (cw, backpatch_start);
+
+    if (prolog_state == GUM_PROLOG_OPEN)
+    {
+      gum_exec_ctx_write_thumb_epilog (ctx, cw);
+    }
+
+    gum_thumb_writer_put_branch_address (cw, GUM_ADDRESS (block->code_begin));
+
+    gum_thumb_writer_flush (cw);
+    g_assert (gum_thumb_writer_offset (cw) <= code_max_size);
+    gum_stalker_freeze (stalker, backpatch_start, code_max_size);
+  }
+}
+
 static GumExecBlock *
 gum_exec_block_new (GumExecCtx * ctx)
 {
@@ -2761,10 +2833,12 @@ gum_exec_block_new (GumExecCtx * ctx)
      * Instrumented ARM code needs to be 4 byte aligned. We will make all code
      * blocks (both ARM and Thumb) 4 byte aligned for simplicity.
      */
-    block->code_begin =
-        GUM_ALIGN_POINTER (guint8 *, slab->data + slab->offset, 4);
+    slab->offset = GUM_ALIGN_SIZE (slab->offset, 4);
+
+    block->code_begin = slab->data + slab->offset;
     block->code_end = block->code_begin;
 
+    block->flags = 0;
     block->recycle_count = 0;
 
     gum_stalker_thaw (stalker, block->code_begin, available);
@@ -2797,7 +2871,7 @@ gum_exec_block_obtain (GumExecCtx * ctx,
   {
     gpointer aligned_address;
 
-    aligned_address = GSIZE_TO_POINTER (GPOINTER_TO_SIZE (real_address) & ~0x1);
+    aligned_address = gum_strip_thumb_bit (real_address);
     if (aligned_address == real_address)
       *code_address_ptr = block->code_begin;
     else
@@ -2822,7 +2896,7 @@ gum_exec_block_obtain_trusted (GumExecCtx * ctx,
     return NULL;
 
   if (block->recycle_count >= ctx->stalker->trust_threshold ||
-      memcmp (real_address, block->real_snapshot,
+      memcmp (gum_strip_thumb_bit (real_address), block->real_snapshot,
           block->real_end - block->real_begin) == 0)
   {
     block->recycle_count++;
@@ -2909,25 +2983,56 @@ gum_exec_block_virtualize_thumb_branch_insn (GumExecBlock * block,
                                              GumGeneratorContext * gc)
 {
   GumExecCtx * ec = block->ctx;
+  GumThumbWriter * cw = gc->thumb_writer;
+  gboolean should_emit_events;
+  GumPrologState backpatch_prolog_state;
+  guint16 * backpatch_code_start;
 
   gum_exec_block_write_thumb_handle_not_taken (block, target, cc, cc_reg, gc);
 
-  gum_exec_block_thumb_open_prolog (block, gc);
+  should_emit_events = !gum_generator_context_is_timing_sensitive (gc) &&
+      (ec->sink_mask & (GUM_EXEC | GUM_BLOCK)) != 0;
+  if (should_emit_events)
+  {
+    gum_exec_block_thumb_open_prolog (block, gc);
+    backpatch_prolog_state = GUM_PROLOG_OPEN;
 
-  if ((ec->sink_mask & GUM_EXEC) != 0)
-    gum_exec_block_write_thumb_exec_event_code (block, gc);
+    if ((ec->sink_mask & GUM_EXEC) != 0)
+      gum_exec_block_write_thumb_exec_event_code (block, gc);
 
-  if ((ec->sink_mask & GUM_BLOCK) != 0)
-    gum_exec_block_write_thumb_block_event_code (block, gc);
+    if ((ec->sink_mask & GUM_BLOCK) != 0)
+      gum_exec_block_write_thumb_block_event_code (block, gc);
+  }
+  else
+  {
+    backpatch_prolog_state = GUM_PROLOG_CLOSED;
+  }
+
+  backpatch_code_start = cw->code;
+
+  if (backpatch_prolog_state == GUM_PROLOG_CLOSED)
+    gum_exec_block_thumb_open_prolog (block, gc);
 
   gum_exec_block_write_thumb_handle_excluded (block, target, FALSE, gc);
   gum_exec_block_write_thumb_handle_kuser_helper (block, target, gc);
+
   gum_exec_block_write_thumb_call_replace_block (block, target, gc);
   gum_exec_block_write_thumb_pop_stack_frame (block, target, gc);
 
+  if (ec->stalker->trust_threshold >= 0 &&
+      target->type == GUM_TARGET_DIRECT_ADDRESS &&
+      gum_is_thumb (target->value.direct_address.address))
+  {
+    gum_thumb_writer_put_call_address_with_arguments (cw,
+        GUM_ADDRESS (gum_exec_ctx_backpatch_thumb_branch_to_current), 3,
+        GUM_ARG_ADDRESS, GUM_ADDRESS (ec),
+        GUM_ARG_ADDRESS, GUM_ADDRESS (backpatch_code_start),
+        GUM_ARG_ADDRESS, GUM_ADDRESS (backpatch_prolog_state));
+  }
+
   gum_exec_block_thumb_close_prolog (block, gc);
 
-  gum_exec_block_write_thumb_exec_generated_code (gc->thumb_writer, block->ctx);
+  gum_exec_block_write_thumb_exec_generated_code (cw, block->ctx);
 }
 
 static void
@@ -3206,7 +3311,7 @@ gum_exec_block_write_arm_handle_kuser_helper (GumExecBlock * block,
    */
   if (target->type == GUM_TARGET_DIRECT_ADDRESS)
   {
-    if (!gum_stalker_is_kuser_helper (target->value.direct_address.address))
+    if (!gum_is_kuser_helper (target->value.direct_address.address))
       return;
   }
 
@@ -3215,7 +3320,7 @@ gum_exec_block_write_arm_handle_kuser_helper (GumExecBlock * block,
     gum_exec_ctx_write_arm_mov_branch_target (block->ctx, target, ARM_REG_R0,
         gc);
     gum_arm_writer_put_call_address_with_arguments (cw,
-        GUM_ADDRESS (gum_stalker_is_kuser_helper), 1,
+        GUM_ADDRESS (gum_is_kuser_helper), 1,
         GUM_ARG_REGISTER, ARM_REG_R0);
     gum_arm_writer_put_cmp_reg_imm (cw, ARM_REG_R0, 0);
     gum_arm_writer_put_b_cond_label (cw, ARM_CC_EQ, not_kuh);
@@ -3311,7 +3416,7 @@ gum_exec_block_write_thumb_handle_kuser_helper (GumExecBlock * block,
 
   if (target->type == GUM_TARGET_DIRECT_ADDRESS)
   {
-    if (!gum_stalker_is_kuser_helper (target->value.direct_address.address))
+    if (!gum_is_kuser_helper (target->value.direct_address.address))
       return;
   }
 
@@ -3320,7 +3425,7 @@ gum_exec_block_write_thumb_handle_kuser_helper (GumExecBlock * block,
     gum_exec_ctx_write_thumb_mov_branch_target (block->ctx,
         target, ARM_REG_R0, gc);
     gum_thumb_writer_put_call_address_with_arguments (cw,
-        GUM_ADDRESS (gum_stalker_is_kuser_helper), 1,
+        GUM_ADDRESS (gum_is_kuser_helper), 1,
         GUM_ARG_REGISTER, ARM_REG_R0);
     gum_thumb_writer_put_cbnz_reg_label (cw, ARM_REG_R0, kuh);
     gum_thumb_writer_put_b_label (cw, not_kuh);
@@ -3619,15 +3724,58 @@ gum_exec_block_write_thumb_handle_not_taken (GumExecBlock * block,
 
   if (cc != ARM_CC_AL)
   {
-    gum_exec_block_thumb_open_prolog (block, gc);
+    gboolean should_emit_events;
+    GumPrologState backpatch_prolog_state;
+    guint16 * backpatch_code_start;
 
-    if ((ec->sink_mask & GUM_EXEC) != 0)
-      gum_exec_block_write_thumb_exec_event_code (block, gc);
+    should_emit_events = !gum_generator_context_is_timing_sensitive (gc) &&
+        (ec->sink_mask & (GUM_EXEC | GUM_BLOCK)) != 0;
+    if (should_emit_events)
+    {
+      gum_exec_block_thumb_open_prolog (block, gc);
+      backpatch_prolog_state = GUM_PROLOG_OPEN;
 
-    if ((ec->sink_mask & GUM_BLOCK) != 0)
-      gum_exec_block_write_thumb_block_event_code (block, gc);
+      if ((ec->sink_mask & GUM_EXEC) != 0)
+        gum_exec_block_write_thumb_exec_event_code (block, gc);
 
-    gum_exec_block_write_thumb_handle_continue (block, gc);
+      if ((ec->sink_mask & GUM_BLOCK) != 0)
+        gum_exec_block_write_thumb_block_event_code (block, gc);
+    }
+    else
+    {
+      backpatch_prolog_state = GUM_PROLOG_CLOSED;
+    }
+
+    backpatch_code_start = cw->code;
+
+    if (backpatch_prolog_state == GUM_PROLOG_CLOSED)
+      gum_exec_block_thumb_open_prolog (block, gc);
+
+    gum_thumb_writer_put_call_address_with_arguments (cw,
+        GUM_ADDRESS (gum_exec_ctx_replace_block), 2,
+        GUM_ARG_ADDRESS, GUM_ADDRESS (ec),
+        GUM_ARG_ADDRESS, GUM_ADDRESS (gc->instruction->end + 1));
+
+    if (ec->stalker->trust_threshold >= 0 &&
+        target->type == GUM_TARGET_DIRECT_ADDRESS &&
+        gum_is_thumb (target->value.direct_address.address))
+    {
+      const guint padding_needed = 5;
+      guint i;
+
+      for (i = 0; i != padding_needed; i++)
+        gum_thumb_writer_put_nop (cw);
+
+      gum_thumb_writer_put_call_address_with_arguments (cw,
+          GUM_ADDRESS (gum_exec_ctx_backpatch_thumb_branch_to_current), 3,
+          GUM_ARG_ADDRESS, GUM_ADDRESS (ec),
+          GUM_ARG_ADDRESS, GUM_ADDRESS (backpatch_code_start),
+          GUM_ARG_ADDRESS, GUM_ADDRESS (backpatch_prolog_state));
+    }
+
+    gum_exec_block_thumb_close_prolog (block, gc);
+
+    gum_exec_block_write_thumb_exec_generated_code (cw, ec);
 
     gum_thumb_writer_put_label (cw, taken);
   }
@@ -3970,14 +4118,20 @@ gum_generator_context_advance_exclusive_load_offset (GumGeneratorContext * gc)
     gc->exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
 }
 
+static gpointer
+gum_strip_thumb_bit (gpointer address)
+{
+  return GSIZE_TO_POINTER (GPOINTER_TO_SIZE (address) & ~0x1);
+}
+
 static gboolean
-gum_stalker_is_thumb (gconstpointer address)
+gum_is_thumb (gconstpointer address)
 {
   return (GPOINTER_TO_SIZE (address) & 0x1) != 0;
 }
 
 static gboolean
-gum_stalker_is_kuser_helper (gconstpointer address)
+gum_is_kuser_helper (gconstpointer address)
 {
 #ifdef HAVE_LINUX
   switch (GPOINTER_TO_SIZE (address))
